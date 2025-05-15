@@ -15,28 +15,46 @@ from insightface.app import FaceAnalysis
 from safetensors.torch import load_file
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms.functional import normalize, resize
-
 from eva_clip import create_model_and_transforms
 from eva_clip.constants import OPENAI_DATASET_MEAN, OPENAI_DATASET_STD
 from pulid.encoders_transformer import IDFormer
-from pulid.utils import is_torch2_available, sample_dpmpp_2m, sample_dpmpp_sde
+from pulid.utils import (
+    is_torch2_available,
+    sample_dpmpp_2m,
+    sample_dpmpp_sde,
+    sample_dpm_2,
+    sample_euler_ancestral,
+    sample_euler
+)
 
 if is_torch2_available():
     from pulid.attention_processor import AttnProcessor2_0 as AttnProcessor
     from pulid.attention_processor import IDAttnProcessor2_0 as IDAttnProcessor
 else:
     from pulid.attention_processor import AttnProcessor, IDAttnProcessor
+from torch import no_grad
+from functools import wraps
+
+
+def inference_no_grad(func):
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        with no_grad():
+            return func(self, *args, **kwargs)
+    return wrapper
 
 
 class PuLIDPipeline:
-    def __init__(self, sdxl_repo='Lykon/dreamshaper-xl-lightning', sampler='dpmpp_sde', *args, **kwargs):
+    def __init__(self, device=None, download_only=False, sdxl_repo='Lykon/dreamshaper-xl-lightning', sampler='dpmpp_sde', *args, **kwargs):
         super().__init__()
-        self.device = 'cuda'
+        self.device = 'cuda' if not download_only else 'cpu'  # 다운로드 시에는 CPU 사용
+        if device is not None:
+            self.device = device
 
         # load base model
-        self.pipe = StableDiffusionXLPipeline.from_pretrained(sdxl_repo, torch_dtype=torch.float16, variant="fp16").to(
-            self.device
-        )
+        self.pipe = StableDiffusionXLPipeline.from_pretrained(sdxl_repo, torch_dtype=torch.float16, variant="fp16")
+        if not download_only:
+            self.pipe = self.pipe.to(self.device)
         self.pipe.watermark = None
         self.hack_unet_attn_layers(self.pipe.unet)
 
@@ -57,9 +75,13 @@ class PuLIDPipeline:
             device=self.device,
         )
         self.face_helper.face_parse = None
-        self.face_helper.face_parse = init_parsing_model(model_name='bisenet', device=self.device)
+        self.face_helper.face_parse = init_parsing_model(model_name='bisenet', device=self.device, half=True)
         # clip-vit backbone
-        model, _, _ = create_model_and_transforms('EVA02-CLIP-L-14-336', 'eva_clip', force_custom_clip=True)
+        model, _, _ = create_model_and_transforms(
+            'EVA02-CLIP-L-14-336',
+            'eva_clip',
+            force_custom_clip=True
+        )
         model = model.visual
         self.clip_vision_model = model.to(self.device)
         eva_transform_mean = getattr(self.clip_vision_model, 'image_mean', OPENAI_DATASET_MEAN)
@@ -72,11 +94,25 @@ class PuLIDPipeline:
         self.eva_transform_std = eva_transform_std
         # antelopev2
         snapshot_download('DIAMONIK7777/antelopev2', local_dir='models/antelopev2')
-        self.app = FaceAnalysis(
-            name='antelopev2', root='.', providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
-        )
+        self.app = None
+        if download_only:
+            self.app = FaceAnalysis(name='antelopev2', root='.', providers=['CPUExecutionProvider'])
+        else:
+            self.app = FaceAnalysis(name='antelopev2', root='.', providers=['CUDAExecutionProvider'])
         self.app.prepare(ctx_id=0, det_size=(640, 640))
-        self.handler_ante = insightface.model_zoo.get_model('models/antelopev2/glintr100.onnx')
+
+        # self.handler_ante = insightface.model_zoo.get_model('models/antelopev2/glintr100.onnx')
+        self.handler_ante = None
+        if download_only:
+            self.handler_ante = insightface.model_zoo.get_model(
+                'models/antelopev2/glintr100.onnx',
+                providers=['CPUExecutionProvider']
+            )
+        else:
+            self.handler_ante = insightface.model_zoo.get_model(
+                'models/antelopev2/glintr100.onnx',
+
+            )
         self.handler_ante.prepare(ctx_id=0)
 
         gc.collect()
@@ -98,6 +134,18 @@ class PuLIDPipeline:
         self.sigmas = ((1 - alphas_cumprod) / alphas_cumprod) ** 0.5
         self.log_sigmas = self.sigmas.log()
         self.sigma_data = 1.0
+
+        # linear_start = 0.0001  # euler_a에 맞게 조정
+        # linear_end = 0.012  # euler_a에 맞게 조정
+        # timesteps = 1000
+        #
+        # betas = torch.linspace(linear_start, linear_end, timesteps, dtype=torch.float64)
+        # alphas = 1.0 - betas
+        # alphas_cumprod = torch.cumprod(alphas, dim=0)
+        #
+        # self.sigmas = ((1 - alphas_cumprod) / alphas_cumprod).sqrt()
+        # self.log_sigmas = self.sigmas.log()
+        # self.sigma_data = 1.0
 
         if sampler == 'dpmpp_sde':
             self.sampler = sample_dpmpp_sde
@@ -125,6 +173,15 @@ class PuLIDPipeline:
         max_inv_rho = self.sigma_max ** (1 / rho)
         sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
         return torch.cat([sigmas, sigmas.new_zeros([1])])
+
+    def get_sigmas_euler(self, steps):
+        # sigma_max와 sigma_min 값을 설정합니다.
+        sigma_max = self.sigma_max  # 모델에 맞게 설정 (예: 10.0)
+        sigma_min = self.sigma_min  # 일반적으로 0.0 또는 매우 작은 값
+
+        # sigma_max에서 sigma_min까지 선형적으로 감소하는 시그마 값을 생성합니다.
+        sigmas = torch.linspace(sigma_max, sigma_min, steps)
+        return sigmas
 
     def hack_unet_attn_layers(self, unet):
         id_adapter_attn_procs = {}
@@ -258,18 +315,39 @@ class PuLIDPipeline:
         # return id_embedding
         return uncond_id_embedding, id_embedding
 
+    # def __call__(self, x, sigma, **extra_args):
+    #     print("__call__", "A")
+    #     x_ddim_space = x / (sigma[:, None, None, None] ** 2 + self.sigma_data**2) ** 0.5
+    #     print("__call__", "B")
+    #     t = self.timestep(sigma)
+    #     print("__call__", "C")
+    #     cfg_scale = extra_args['cfg_scale']
+    #     eps_positive = self.pipe.unet(x_ddim_space, t, return_dict=False, **extra_args['positive'])[0]
+    #     eps_negative = self.pipe.unet(x_ddim_space, t, return_dict=False, **extra_args['negative'])[0]
+    #     print("__call__", "D")
+    #     noise_pred = eps_negative + cfg_scale * (eps_positive - eps_negative)
+    #     return x - noise_pred * sigma[:, None, None, None]
+
+    # 수정된 __call__ 메서드
     def __call__(self, x, sigma, **extra_args):
-        x_ddim_space = x / (sigma[:, None, None, None] ** 2 + self.sigma_data**2) ** 0.5
+        x = x.to(dtype=sigma.dtype)
+        x_ddim_space = x / (sigma[:, None, None, None] ** 2 + self.sigma_data ** 2).sqrt()
         t = self.timestep(sigma)
+        t = t.to(dtype=sigma.dtype)
+        
         cfg_scale = extra_args['cfg_scale']
         eps_positive = self.pipe.unet(x_ddim_space, t, return_dict=False, **extra_args['positive'])[0]
         eps_negative = self.pipe.unet(x_ddim_space, t, return_dict=False, **extra_args['negative'])[0]
+        
         noise_pred = eps_negative + cfg_scale * (eps_positive - eps_negative)
+        # 여기가 핵심 변경점: denoised를 반환하는 대신 원래 공간으로 변환
         return x - noise_pred * sigma[:, None, None, None]
 
+    @inference_no_grad
     def inference(
         self,
         prompt,
+        scheduler,
         size,
         prompt_n='',
         id_embedding=None,
@@ -279,6 +357,10 @@ class PuLIDPipeline:
         steps=4,
         seed=-1,
     ):
+        if scheduler == 'dpmpp_sde':
+            self.sampler = sample_dpmpp_sde
+        if scheduler == 'euler_a':
+            self.sampler = sample_euler_ancestral
 
         # sigmas
         sigmas = self.get_sigmas_karras(steps).to(self.device)
